@@ -6,6 +6,8 @@ This document details all the errors, issues, and challenges encountered during 
 ---
 
 ## Table of Contents
+
+### Packaging & Distribution Issues
 1. [Unnecessary Large Files Included in Initial Zip](#1-unnecessary-large-files-included-in-initial-zip)
 2. [Missing RYU Virtual Environment Activation Step](#2-missing-ryu-virtual-environment-activation-step)
 3. [Missing Mininet Cleanup Instructions](#3-missing-mininet-cleanup-instructions)
@@ -16,6 +18,13 @@ This document details all the errors, issues, and challenges encountered during 
 8. [Hardcoded File Paths in Scripts](#8-hardcoded-file-paths-in-scripts)
 9. [Missing TCP vs DCTCP Comparison Script](#9-missing-tcp-vs-dctcp-comparison-script)
 10. [Unclear Experiment Results Location](#10-unclear-experiment-results-location)
+
+### SDN-Specific Errors
+11. [Ryu Controller Startup Warnings](#11-ryu-controller-startup-warnings)
+12. [Pingall Failures / Destination Host Unreachable](#12-pingall-failures--destination-host-unreachable)
+13. [Controller-Switch Connectivity Issues](#13-controller-switch-connectivity-issues)
+14. [Fat-Tree Topology Complexity Issues](#14-fat-tree-topology-complexity-issues)
+15. [Flow Table Verification](#15-flow-table-verification)
 
 ---
 
@@ -396,6 +405,265 @@ Before distribution, the following checks were performed:
 
 ---
 
+## SDN-Specific Errors and Solutions
+
+This section documents the core SDN networking issues encountered during development and testing of the Fat-Tree topology with the Ryu controller.
+
+---
+
+### 11. Ryu Controller Startup Warnings
+
+#### Errors Encountered
+
+Two persistent warnings appeared every time the Ryu controller was launched:
+
+1. **`RuntimeWarning: greenlet.greenlet size changed, may indicate binary incompatibility`**
+   - Caused by ABI mismatch between different greenlet builds across system paths
+
+2. **`X RLock(s) were not greened`**
+   - Caused by Eventlet monkey patching occurring too late in the import sequence
+
+#### Attempted Fixes (Unsuccessful)
+
+| Attempt | Why It Failed |
+|---------|---------------|
+| Reinstalled greenlet with `pip3 install --force-reinstall --no-binary greenlet` pinned to v1.1.3 | Python still loaded stray `.so` files from other paths |
+| Purged greenlet from `~/.local` and `/usr/local` | Multiple copies persisted; prefix confusion |
+| Synchronized Python prefixes | Ryu's `manager.py` unconditionally imports `gevent.monkey`, pulling in vendored `_greenlet*.so` |
+
+#### Final Solution: Virtual Environment + Custom Launcher
+
+**Step 1: Create a clean virtual environment**
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip setuptools wheel
+pip install 'setuptools<58'  # Required for Ryu's PBR hooks
+pip install -e .              # Install Ryu in editable mode
+```
+
+**Step 2: Create `run_ryu.py` launcher script**
+
+This script ensures eventlet is monkey-patched *before* any other imports:
+
+```python
+#!/usr/bin/env python3
+import os
+os.environ['RYU_USE_GEVENT'] = '0'
+
+import eventlet
+eventlet.monkey_patch()
+
+from ryu.cmd.manager import main
+main()
+```
+
+**Step 3: Run with the launcher**
+
+```bash
+chmod +x run_ryu.py
+sudo ./run_ryu.py --ofp-tcp-listen-port 6653 ryu.app.simple_switch_stp_13
+```
+
+**Why It Worked:**
+- The venv isolated a single, consistent greenlet build
+- The wrapper ensured eventlet patching happened before any locks were created
+- Gevent was installed in the venv so Ryu's imports never failed
+
+---
+
+### 12. Pingall Failures / Destination Host Unreachable
+
+#### Symptoms
+
+- `pingall` command failed with "Destination Host Unreachable"
+- Hosts could not communicate across the Fat-Tree topology
+- Some pings worked, others failed inconsistently
+
+#### Root Cause Analysis
+
+**ARP Resolution Failure:**
+
+When checking ARP tables on hosts:
+
+```bash
+mininet> h3 arp -n
+Address                  HWtype  HWaddress           Flags Mask            Iface
+10.0.0.4                         (incomplete)                              h3-eth0
+
+mininet> h4 arp -n
+Address                  HWtype  HWaddress           Flags Mask            Iface
+10.0.0.3                 ether   00:00:00:00:00:03   C                     h4-eth0
+```
+
+**Interpretation:**
+- h3's ARP entry for h4 (10.0.0.4) shows `(incomplete)` — h3 sent an ARP request but never received a reply
+- h4 has a complete ARP entry for h3 — the reverse direction worked
+- Without h4's MAC address, h3 cannot form valid unicast frames
+- The Ryu controller never sees unicast traffic to trigger flow installation
+
+#### Why This Matters for SDN
+
+1. **No Unicast Flows Installed:** The learning switch logic depends on seeing unicast packets. If ARP fails, no unicast packets are generated.
+
+2. **Broadcast Handling:** Simple learning switches often don't install specific flows for broadcast traffic (like ARP requests). If ARP replies are lost, the whole communication chain breaks.
+
+3. **Timing Issues:** Even if flows are installed, they may expire before verification if idle timeouts are short.
+
+#### Debugging Steps
+
+```bash
+# Check ARP tables on hosts
+mininet> h3 arp -n
+mininet> h4 arp -n
+
+# Run tcpdump to observe ARP traffic
+mininet> h4 tcpdump -i h4-eth0 arp &
+
+# Inspect flow tables on switches
+sudo ovs-ofctl dump-flows s1 -O OpenFlow13
+```
+
+#### Solution
+
+1. **Use STP-enabled learning switch** to prevent broadcast storms in the Fat-Tree topology:
+   ```bash
+   sudo ./run_ryu.py --ofp-tcp-listen-port 6653 ryu.app.simple_switch_stp_13
+   ```
+
+2. **Verify controller-switch connectivity** before testing:
+   ```bash
+   sudo ovs-vsctl show
+   # Look for "is_connected: true" on each switch
+   ```
+
+3. **Clean up stale state** before each test:
+   ```bash
+   sudo mn -c
+   ```
+
+---
+
+### 13. Controller-Switch Connectivity Issues
+
+#### Potential Issues
+
+- Port number mismatch between Ryu controller and OVS switches
+- Firewall blocking OpenFlow port (6633 or 6653)
+- Service conflicts on the OpenFlow port
+
+#### Verification Command
+
+```bash
+sudo ovs-vsctl show
+```
+
+**Expected Output (Good):**
+```
+Bridge "s1"
+    Controller "tcp:127.0.0.1:6653"
+        is_connected: true
+    ...
+```
+
+If `is_connected: true` appears for all switches, the TCP connection is established and there are no firewall/port issues.
+
+#### Troubleshooting Connectivity
+
+```bash
+# Check if controller port is in use
+sudo lsof -i :6653
+
+# Check for existing Ryu processes
+ps aux | grep ryu
+
+# Kill stale Ryu processes
+sudo kill $(ps aux | grep ryu | grep -v grep | awk '{print $2}')
+```
+
+---
+
+### 14. Fat-Tree Topology Complexity Issues
+
+#### Problem
+
+The custom Fat-Tree topology with core, aggregation, and edge switches is significantly more complex than simple linear or tree topologies. Issues encountered:
+
+- Cross-pod connectivity failures
+- Loops causing broadcast storms
+- Inconsistent host placement
+
+#### Key Considerations
+
+| Layer | Switch Type | Connectivity |
+|-------|-------------|--------------|
+| Core | Core switches | Connect to all pods |
+| Aggregation | Aggregation switches | Connect core to edge |
+| Edge | Edge switches | Connect directly to hosts |
+
+#### Solution
+
+1. **Use STP (Spanning Tree Protocol)** to prevent loops:
+   ```bash
+   ryu.app.simple_switch_stp_13  # Instead of simple_switch_13
+   ```
+
+2. **Verify link establishment** between all layers
+
+3. **Check host IP/MAC assignment** consistency
+
+4. **Use OpenFlow13 protocol** explicitly:
+   ```python
+   # In topology code
+   switch = self.addSwitch('s1', protocols='OpenFlow13')
+   ```
+
+---
+
+### 15. Flow Table Verification
+
+#### How to Check Flow Rules
+
+```bash
+# Dump flows on a specific switch
+sudo ovs-ofctl dump-flows s1 -O OpenFlow13
+
+# Check all switches in a loop
+for i in 1 2 3 4; do
+    echo "=== Switch s$i ==="
+    sudo ovs-ofctl dump-flows s$i -O OpenFlow13
+done
+```
+
+#### Expected Flow Entries
+
+| Entry Type | Description |
+|------------|-------------|
+| Default rule (priority=0) | Forwards unmatched packets to controller (packet-in) |
+| Learned rules (priority>0) | Match on MAC addresses, forward to specific port |
+
+**Signs of Successful Learning:**
+- Non-zero `n_packets` and `n_bytes` counters on learned flows
+- Flows with specific `dl_dst` (destination MAC) matches
+- Multiple flow entries beyond just the default table-miss rule
+
+---
+
+### SDN Error Summary Table
+
+| Error | Root Cause | Solution |
+|-------|-----------|----------|
+| Greenlet ABI warning | Multiple conflicting greenlet builds | Clean venv with single build |
+| RLock not greened | Eventlet patched too late | Custom launcher with early `monkey_patch()` |
+| Incomplete ARP entries | ARP replies not reaching requester | Use STP-enabled switch, verify paths |
+| Destination unreachable | No unicast flows installed | Resolve ARP first → flows auto-install |
+| Switch not connected | Port mismatch / firewall | Verify with `ovs-vsctl show` |
+| Broadcast storms | Loops in Fat-Tree topology | Use `simple_switch_stp_13` |
+
+---
+
 *Report generated during project preparation session*
 *Date: April 30, 2025*
+*Updated: December 9, 2025 - Added SDN-specific troubleshooting section*
 
